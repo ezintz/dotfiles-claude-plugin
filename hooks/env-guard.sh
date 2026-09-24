@@ -77,6 +77,18 @@ esac
 # The project the command runs in, for guard_allowed. Every hook payload
 # carries it; the fallback is for running this script by hand.
 [ -n "$GUARD_CWD" ] || GUARD_CWD="$PWD"
+# `>|` is a redirect, not a pipe — and under this shell's noclobber it is the
+# only way to overwrite a file, so it is the *idiomatic* form here rather than a
+# curiosity. Everything downstream splits on `|`: segmentation cut `echo … >|
+# deploy.sh` in two, leaving the redirect target as its own segment, so
+# write-then-run stopped pairing and guard_heredoc_consumer read the target as
+# the consumer. Normalized once, here, rather than teaching four readers about
+# it — and behind a glob, so a command without one pays nothing. It cannot be a
+# parameter expansion: `${cmd//>|/>}` is the quadratic bash 3.2 case, 4.8s on a
+# 8 KB payload with a thousand of them.
+case "$GUARD_CMD" in
+  *'>|'*) GUARD_CMD=$(printf '%s' "$GUARD_CMD" | sed 's/>|/>/g') ;;
+esac
 # Pre-strip copy: a profile whose payload IS its heredoc body (mysql/psql SQL,
 # not YAML/values data) reconstructs it from this via guard_heredoc_body_for.
 GUARD_RAW_CMD="$GUARD_CMD"
@@ -142,6 +154,16 @@ case "$GUARD_ALL_SEGMENTS" in
     GUARD_OPAQUE=$(printf '%s' "$GUARD_ALL_SEGMENTS" \
       | sed -n 's/^#guard-opaque-pipe //p' | head -n1)
     guard_ask "\`${GUARD_OPAQUE%% *}\` output is piped into \`${GUARD_OPAQUE##* }\`: the script runs before it can be read. Explicit user confirmation required." ;;
+esac
+
+# The same thing with a file in the middle: a script this command generates and
+# then executes does not exist yet, so what it will contain cannot be read from
+# the command line either. Settled here for the same reason.
+case "$GUARD_ALL_SEGMENTS" in
+  *'#guard-opaque-write '*)
+    GUARD_OPAQUE=$(printf '%s' "$GUARD_ALL_SEGMENTS" \
+      | sed -n 's/^#guard-opaque-write //p' | head -n1)
+    guard_ask "\`${GUARD_OPAQUE%% *}\` writes \`${GUARD_OPAQUE##* }\`, which this same command then runs: the script's contents cannot be read before it executes. Explicit user confirmation required." ;;
 esac
 
 # guard-lib turns globbing off (untrusted word-splitting); turn it back on just
@@ -256,11 +278,19 @@ for guard_profile in "${GUARD_PROFILES[@]}"; do
 
   # A heredoc body that hands this binary to an interpreter's exec API runs it,
   # and the body is too opaque to resolve a target from — so it asks, naming the
-  # binary rather than a cluster it cannot determine.
+  # binary rather than a cluster it cannot determine. The verb it *can* read
+  # goes in the prompt: "runs helm uninstall" is something to approve or refuse,
+  # where a bare binary name leaves nothing to decide on.
   if [ -n "$GUARD_HEREDOC_BODY" ]; then
     for guard_b in $GUARD_BINS; do
       guard_heredoc_shells_out "$guard_b" || continue
-      guard_ask "A heredoc body passed to ${GUARD_HEREDOC_CONSUMER:-an interpreter} shells out to $guard_b (its target cannot be read from the body). $GUARD_REASON_TAIL"
+      if [ "$GUARD_HEREDOC_MANY" = 1 ]; then
+        guard_ask "A heredoc body passed to ${GUARD_HEREDOC_CONSUMER:-an interpreter} calls $guard_b more times than can be read one by one, so none of them has been vouched for. $GUARD_REASON_TAIL"
+      elif [ -n "$GUARD_HEREDOC_ACTION" ]; then
+        guard_ask "A heredoc body passed to ${GUARD_HEREDOC_CONSUMER:-an interpreter} runs $guard_b \"$GUARD_HEREDOC_ACTION\" (its target cannot be read from the body). $GUARD_REASON_TAIL"
+      else
+        guard_ask "A heredoc body passed to ${GUARD_HEREDOC_CONSUMER:-an interpreter} shells out to $guard_b with no readable subcommand (neither the verb nor its target can be read from the body). $GUARD_REASON_TAIL"
+      fi
     done
   fi
 

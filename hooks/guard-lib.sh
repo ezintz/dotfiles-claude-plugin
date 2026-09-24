@@ -193,11 +193,35 @@ $1
 EOF
 }
 
-# Interpreter APIs that hand a string to a shell or exec a program. Deliberately
-# NOT including backticks or $( ) — those are handled precisely by
-# guard_heredoc_expansions, and inside a *quoted* heredoc the shell never
-# evaluates them anyway.
-GUARD_EXEC_HINTS='os\.system|os\.popen|os\.exec|os\.spawn|subprocess|pty\.spawn|commands\.getoutput|shell_exec|proc_open|passthru|popen\(|system\(|exec\(|qx[({/|]|%x[({]|Open3|IO\.popen|Kernel#?\.?(system|spawn)|child_process|execSync|spawnSync|execFileSync|(sh|bash|zsh|ash|dash)[[:space:]]+-c'
+# Interpreter APIs that hand a string to a shell or exec a program, named the
+# same way in whatever language they appear in. `$( )` is deliberately absent —
+# that is the shell's own syntax, handled precisely by guard_heredoc_expansions,
+# and inside a *quoted* heredoc the shell never evaluates it anyway. Syntax that
+# only means "run this" in some languages lives in the per-language sets below,
+# which guard_exec_re adds according to who consumes the body.
+GUARD_EXEC_HINTS='os\.system|os\.popen|os\.exec|os\.spawn|subprocess|pty\.spawn|commands\.getoutput|shell_exec|proc_open|passthru|popen\(|system\(|system2|exec\(|Open3|IO\.popen|Process\.spawn|Kernel#?\.?(system|spawn)|child_process|execSync|spawnSync|execFileSync|execa|Bun\.spawn|Deno\.Command|plumbum|processx|do[[:space:]]+shell[[:space:]]+script'
+# Two that need a boundary of their own rather than a bare name. `sh.kubectl(…)`
+# is the python sh module calling a binary by attribute, and a plain `sh\.` would
+# also read `deploy.sh.bak` as one. invoke and fabric run commands through a bare
+# `run(…)` that is indistinguishable from any other function, so the import is
+# the only text that says a shell is involved at all.
+GUARD_EXEC_HINTS="$GUARD_EXEC_HINTS"'|(^|[^A-Za-z0-9_.])sh\.[A-Za-z_]|from[[:space:]]+(invoke|fabric)[[:space:]]+import|(invoke|fabric)\.(run|sudo)'
+GUARD_EXEC_HINTS="$GUARD_EXEC_HINTS"'|(sh|bash|zsh|ash|dash)[[:space:]]+-c'
+# Exec syntax that is exec syntax only in the language holding it. A backtick in
+# a Ruby, Perl or PHP script runs a command; the same backtick in a python
+# heredoc writing Markdown is a code span in prose, and reading that as an
+# invocation is exactly the writing-vs-executing mistake. `%x[…]` belongs here
+# too — and note the delimiter class: Ruby takes any bracket, and the old
+# `%x[({]` left out the `[` form, so `%x[kubectl delete …]` matched nothing.
+GUARD_EXEC_HINTS_BACKTICK='`|qx[[({/|!]|%x[[({/|!]|["'"'"']-\|["'"'"']'
+# zx's $`…` runs a command; a template literal is otherwise just a string.
+GUARD_EXEC_HINTS_TEMPLATE='\$`'
+# expect's whole purpose is driving a program it spawns.
+GUARD_EXEC_HINTS_SPAWN='(^|[^A-Za-z0-9_.])spawn[[:space:]]'
+# Ways a program writes a file, for guard_inline_scripts: the question there is
+# only whether the body creates the script it is about to run, never what the
+# script says, so a name is enough and nothing needs parsing.
+GUARD_FILE_WRITE_HINTS='\.write|write_text|write_bytes|writelines|open\([^)]*[,(][[:space:]]*.[wa]'
 
 # Who consumes a heredoc decides what the body *is*.
 #
@@ -206,19 +230,31 @@ GUARD_EXEC_HINTS='os\.system|os\.popen|os\.exec|os\.spawn|subprocess|pty\.spawn|
 # executes it as code in another language, where the only thing we can spot is
 # a call into an exec API. Everything else — `git commit -F -`, `cat > file`,
 # `tee`, `jq`, `kubectl apply -f -` — is being handed data, and data that
-# happens to contain the word `kubectl` is not an invocation.
-GUARD_HEREDOC_SHELL_HEADS='sh|bash|zsh|ksh|dash|ash|ssh'
-GUARD_HEREDOC_INTERP_HEADS='python|python2|python3|ruby|perl|node|php|lua|deno|bun|Rscript|osascript'
+# happens to contain the word `kubectl` is not an invocation. Which of the three
+# it is comes from guard_heredoc_runs, not from these lists alone: a transport
+# hands the body on to whatever it was told to run.
+GUARD_HEREDOC_SHELL_HEADS='sh|bash|zsh|ksh|dash|ash|fish|pwsh|powershell|csh|tcsh|ssh'
+# Matched with an optional version suffix (see guard_heredoc_is_interp), because
+# `python3.12 - <<'PY'` is python and a list can only ever name the versions
+# someone has already installed.
+GUARD_HEREDOC_INTERP_HEADS='python|python2|python3|ruby|perl|node|php|lua|deno|bun|Rscript|osascript|julia|expect|tsx|ts-node|awk|gawk|mawk|nawk'
+# awk takes its program from stdin only with `-f -`; every other `awk … <<EOF`
+# is feeding it data, and reading a data body as code is the mistake in the
+# other direction.
+GUARD_HEREDOC_PROGRAM_FLAG='awk|gawk|mawk|nawk'
 # Container runtimes are transport, not the consumer: `docker exec -i box bash
-# <<EOF` runs the body in a shell. The shell word appears later on the line.
-GUARD_HEREDOC_TRANSPORTS='docker|podman|nerdctl|lima|colima|kubectl'
+# <<EOF` runs the body in a shell. The word that runs it appears later on the
+# line — and it need not be a shell, `docker exec -i box python3 -` is as real
+# as the bash form. ssh is both: a shell by default, transport when the command
+# it is given names an interpreter.
+GUARD_HEREDOC_TRANSPORTS='docker|podman|nerdctl|lima|colima|kubectl|ssh'
 # Every word that could make a heredoc body executable, as one word-bounded
 # regex. A consumer that never appears anywhere in the command cannot appear on
 # a heredoc's opening line either, so this is a sound necessary condition — and
 # it is what keeps `cat > notes.md <<'EOF' … EOF`, far and away the most common
 # heredoc there is, from walking its own body twice to learn that `cat` runs
 # nothing. Word boundaries matter: a plain `*sh*` glob matches "should".
-GUARD_HEREDOC_EXEC_RE='(^|[^A-Za-z0-9_./-])(sh|bash|zsh|ksh|dash|ash|ssh|python|python2|python3|ruby|perl|node|php|lua|deno|bun|Rscript|osascript|docker|podman|nerdctl|lima|colima|kubectl)([^A-Za-z0-9_-]|$)'
+GUARD_HEREDOC_EXEC_RE='(^|[^A-Za-z0-9_./-])(sh|bash|zsh|ksh|dash|ash|fish|pwsh|powershell|csh|tcsh|ssh|python|python2|python3|ruby|perl|node|php|lua|deno|bun|Rscript|osascript|julia|expect|tsx|ts-node|awk|gawk|mawk|nawk|docker|podman|nerdctl|lima|colima|kubectl)([^A-Za-z0-9_-]|$)'
 
 # guard_head_word <segment> — basename of the segment's command word, after env
 # assignments and transparent wrappers, into $GUARD_HEAD_WORD. Non-zero when the
@@ -237,6 +273,32 @@ guard_head_word() {
     case "${GUARD_TOKENS[$i]}" in
       [A-Za-z_]*=*)                        i=$((i + 1)); continue ;;
       sudo|env|nohup|time|exec|stdbuf|doas) i=$((i + 1)); continue ;;
+      # Compound-command keywords. A segment cut out of `for f in *; do bash x`
+      # or `if ok; then bash x` still carries the keyword where the command
+      # word should be, so a heredoc opened inside a loop body read as being
+      # consumed by `do` — which runs nothing, so the body became data.
+      do|then|else|elif)                   i=$((i + 1)); continue ;;
+      # Runners that exist to launch someone else's command word: `uvx python -`
+      # and `npx tsx -` really are python and tsx, and a heredoc behind one read
+      # as being consumed by a program that runs nothing. Their own flags go
+      # with them — and timeout's duration, which is the only bare word here
+      # that is an argument rather than the command.
+      timeout|xargs|uvx|npx|bunx|pnpx)
+        i=$((i + 1))
+        while [ $i -lt $n ]; do
+          case "${GUARD_TOKENS[$i]}" in
+            -*|[0-9]*|'{}') i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        continue ;;
+      # These launch one only via `run`: `uv run python -` is python, while
+      # `uv pip install …` and `poetry add …` are the tool's own commands.
+      uv|poetry|pipenv|pdm|rye|hatch)
+        if [ $((i + 1)) -lt $n ] && [ "${GUARD_TOKENS[$((i + 1))]}" = run ]; then
+          i=$((i + 2)); continue
+        fi
+        break ;;
     esac
     break
   done
@@ -245,19 +307,107 @@ guard_head_word() {
   return 0
 }
 
-# guard_heredoc_is_shell <consumer> <opening-line> — 0 when the body will be
-# executed line by line as a shell script.
-guard_heredoc_is_shell() {
-  local consumer="$1" line="$2" t
-  [[ "$consumer" =~ ^($GUARD_HEREDOC_SHELL_HEADS)$ ]] && return 0
-  [[ "$consumer" =~ ^($GUARD_HEREDOC_TRANSPORTS)$ ]] || return 1
-  guard_tokenize "$line"
-  for t in ${GUARD_TOKENS[@]+"${GUARD_TOKENS[@]}"}; do
-    case "${t##*/}" in
-      sh|bash|zsh|ksh|dash|ash) return 0 ;;
-    esac
+# guard_heredoc_consumer <opening-line> — the command that actually consumes
+# the heredoc opened on this line, into $GUARD_HEAD_WORD. Non-zero when the
+# line has no command word at all.
+#
+# Not the head word of the *line*: `cd /repo && bash <<'EOF'` is consumed by
+# bash, not by cd. Reading the line head made every heredoc sitting behind a
+# `cd …  &&`, a `;`, a pipe or a loop keyword look like it was handed to
+# something that runs nothing — so a script arriving on stdin was filed as
+# data and executed unguarded. One question, asked in three places
+# (guard_heredoc_bodies for both execution modes, guard_inline_scripts for
+# write-then-run), so all three had the same hole.
+#
+# The consumer is the last simple command before the operator. Both walkers
+# resolve the *last* `<<` on the line — their spec regex is greedy — so the
+# truncation matches, and they cannot disagree about which heredoc is opening.
+# Everything else about the line (redirect targets, the shell word a transport
+# runs) is still read from the whole line, because `cat <<'EOF' > out.sh` puts
+# it on the far side of the operator.
+#
+# Pure parameter expansion: `${pre##*X}` is the text after the last X, so the
+# shortest of those candidates is the text after the latest separator of any
+# kind. No fork, and nothing that scales with the body — this runs per opening
+# line, and `guard_segments` here would be a fork per heredoc in the command.
+guard_heredoc_consumer() {
+  local pre="${1%<<*}" cand tail sep
+  tail="$pre"
+  for sep in ';' '&' '|' '(' ')' '{' '}' '`'; do
+    cand="${pre##*"$sep"}"
+    [ ${#cand} -lt ${#tail} ] && tail="$cand"
   done
-  return 1
+  guard_head_word "$tail"
+}
+
+# guard_heredoc_is_interp <word> [opening-line] — 0 when <word> runs a heredoc
+# body as code in its own language.
+guard_heredoc_is_interp() {
+  local w="$1" line="${2:-}"
+  [[ "$w" =~ ^($GUARD_HEREDOC_INTERP_HEADS)([0-9]+(\.[0-9]+)*)?$ ]] || return 1
+  # The version suffix is matched rather than listed because a list can only
+  # name the interpreters someone has already installed: `python3.12 - <<'PY'`
+  # is python, and so is whatever the next machine ships.
+  if [[ "$w" =~ ^($GUARD_HEREDOC_PROGRAM_FLAG)$ ]]; then
+    case " $line " in *' -f'*) ;; *) return 1 ;; esac
+  fi
+  return 0
+}
+
+# guard_heredoc_runs <consumer> <opening-line> — how the body will be run, into
+# $GUARD_HEREDOC_RUNS (`shell` or `interp`), and what to attribute it to, into
+# $GUARD_HEREDOC_BY. Non-zero when nothing on the line runs it, i.e. the body is
+# data.
+#
+# The consumer names a program, but not always the one that executes the body.
+# `docker exec -i box python3 -` and `ssh buildhost python3 -` both hand it to
+# python on the far side, and reading only the consumer made the first data and
+# the second a shell *script* — the worse of the two, because python source read
+# line by line as shell classifies as nothing at all and says so with confidence.
+# So a transport is resolved to the first shell or interpreter word after it, and
+# only falls back to "shell" when it names none. ssh is in both lists for exactly
+# this: a shell by default, transport the moment it is handed a command.
+GUARD_HEREDOC_RUNS=''
+GUARD_HEREDOC_BY=''
+guard_heredoc_runs() {
+  local consumer="$1" line="$2" w i=0 n shell=0 transport=0
+  GUARD_HEREDOC_RUNS=''
+  GUARD_HEREDOC_BY="$consumer"
+  if guard_heredoc_is_interp "$consumer" "$line"; then
+    GUARD_HEREDOC_RUNS='interp'
+    return 0
+  fi
+  [[ "$consumer" =~ ^($GUARD_HEREDOC_SHELL_HEADS)$ ]] && shell=1
+  [[ "$consumer" =~ ^($GUARD_HEREDOC_TRANSPORTS)$ ]] && transport=1
+  if [ $transport = 1 ]; then
+    guard_tokenize "$line"
+    n=${#GUARD_TOKENS[@]}
+    # Past the consumer's own token first, or `ssh` answers for the `python3`
+    # it was told to run.
+    while [ $i -lt $n ]; do
+      w="${GUARD_TOKENS[$i]##*/}"
+      i=$((i + 1))
+      [ "$w" = "$consumer" ] && break
+    done
+    while [ $i -lt $n ]; do
+      w="${GUARD_TOKENS[$i]##*/}"
+      i=$((i + 1))
+      if [[ "$w" =~ ^($GUARD_HEREDOC_SHELL_HEADS)$ ]]; then
+        GUARD_HEREDOC_RUNS='shell'
+        return 0
+      fi
+      if guard_heredoc_is_interp "$w" "$line"; then
+        # Attributed to the interpreter, not the transport: it is what decides
+        # which syntax in the body is a call (see guard_exec_re).
+        GUARD_HEREDOC_RUNS='interp'
+        GUARD_HEREDOC_BY="$w"
+        return 0
+      fi
+    done
+  fi
+  [ $shell = 1 ] || return 1
+  GUARD_HEREDOC_RUNS='shell'
+  return 0
 }
 
 # guard_heredoc_bodies <command> [all|unquoted|shell|interp]
@@ -310,16 +460,12 @@ guard_heredoc_bodies() {
           all)      emit=1 ;;
           unquoted) [ "$quoted" = 0 ] && emit=1 ;;
           shell|interp)
-            guard_head_word "$line" || GUARD_HEAD_WORD=''
+            guard_heredoc_consumer "$line" || GUARD_HEAD_WORD=''
             consumer="$GUARD_HEAD_WORD"
-            if [ -n "$consumer" ]; then
-              if [ "$want" = shell ]; then
-                guard_heredoc_is_shell "$consumer" "$line" && emit=1
-              elif [[ "$consumer" =~ ^($GUARD_HEREDOC_INTERP_HEADS)$ ]]; then
-                emit=1
-              fi
+            if [ -n "$consumer" ] && guard_heredoc_runs "$consumer" "$line"; then
+              [ "$GUARD_HEREDOC_RUNS" = "$want" ] && emit=1
             fi
-            [ "$emit" = 1 ] && printf '#guard-src:heredoc into %s\n' "$consumer" ;;
+            [ "$emit" = 1 ] && printf '#guard-src:heredoc into %s\n' "$GUARD_HEREDOC_BY" ;;
         esac ;;
     esac
   done <<EOF
@@ -358,19 +504,131 @@ guard_heredoc_expansions() {
     | sed -e 's/^\$(//' -e 's/^`//' -e 's/)$//' -e 's/`$//'
 }
 
-# guard_heredoc_shells_out <binary>
-# 0 when a heredoc body both mentions <binary> and calls an interpreter API that
-# can run it — `python3 - <<'PY' … subprocess.run(['kubectl','delete',…]) … PY`.
-# The body is opaque: we cannot tell which target it would hit, or whether the
-# mention is even the one executed, so the caller asks rather than guessing.
-# Writing chart YAML or a pipeline file trips neither half and stays silent.
-guard_heredoc_shells_out() {
-  local bin="$1"
-  [ -n "${GUARD_HEREDOC_BODY:-}" ] || return 1
-  printf '%s' "$GUARD_HEREDOC_BODY" | grep -qE "$GUARD_EXEC_HINTS" || return 1
-  printf '%s' "$GUARD_HEREDOC_BODY" \
-    | grep -qE "(^|[^A-Za-z0-9_./-])$bin([^A-Za-z0-9_-]|\$)" || return 1
+# guard_exec_re — the exec-API regex to read this body with, into
+# $GUARD_EXEC_RE: the language-agnostic set, plus whatever counts as exec syntax
+# in the languages that actually consume a body here. The consumer is already
+# recorded in the body's `#guard-src:` marker, so this is a glob rather than a
+# fork, and it is cached because guard_heredoc_shells_out runs once per guarded
+# binary while the answer does not vary between them.
+GUARD_EXEC_RE=''
+guard_exec_re() {
+  [ -n "$GUARD_EXEC_RE" ] && return 0
+  GUARD_EXEC_RE="$GUARD_EXEC_HINTS"
+  case "$GUARD_HEREDOC_BODY" in
+    *'heredoc into ruby'*|*'heredoc into perl'*|*'heredoc into php'*|*'heredoc into julia'*)
+      GUARD_EXEC_RE="$GUARD_EXEC_RE|$GUARD_EXEC_HINTS_BACKTICK" ;;
+  esac
+  case "$GUARD_HEREDOC_BODY" in
+    *'heredoc into node'*|*'heredoc into deno'*|*'heredoc into bun'*|*'heredoc into tsx'*|*'heredoc into ts-node'*)
+      GUARD_EXEC_RE="$GUARD_EXEC_RE|$GUARD_EXEC_HINTS_TEMPLATE" ;;
+  esac
+  case "$GUARD_HEREDOC_BODY" in
+    *'heredoc into expect'*) GUARD_EXEC_RE="$GUARD_EXEC_RE|$GUARD_EXEC_HINTS_SPAWN" ;;
+  esac
   return 0
+}
+
+# guard_heredoc_shells_out <binary>
+# 0 when a heredoc body hands <binary> to an interpreter API that can run it —
+# `python3 - <<'PY' … subprocess.run(['kubectl','delete',…]) … PY` — in a way
+# that has to be asked about. GUARD_HEREDOC_ACTION names the verb when one was
+# read. Writing chart YAML or a pipeline file trips none of it and stays quiet.
+#
+# The body is another language's source, so there is no argv to classify — but
+# the *text of the call* names the verb, and reading it with the profile's own
+# classifier is what keeps this in step with the guard it belongs to. Three
+# outcomes per mention:
+#
+#   destructive verb   ask, naming it    subprocess.run(['git','push','--force',…])
+#   read-only verb     mention is clear  subprocess.run(['git','grep',…])
+#   no verb at all     ask               subprocess.run(['git'] + sys.argv[1:])
+#
+# Asking on every mention was the older rule, and it cost more than it bought:
+# `git grep`, `kubectl get` and `terraform show` inside a python one-liner are
+# routine analysis, and a guard that prompts on those gets approved by reflex —
+# exactly where it then fails to protect the push that rewrites main. The third
+# outcome is what keeps that from being a bypass: an argv assembled at runtime
+# reads as unclassifiable, not as safe.
+#
+# Classification proper lives in env-guard.sh (guard_classify, and whatever
+# guard_classify_extra the profile defines); this only turns the call text back
+# into an argv for it. That is deliberate — `terraform state list` and
+# `terraform state rm` differ by a word the profile already knows how to read,
+# and a second vocabulary here would drift from the first one.
+GUARD_HEREDOC_ACTION=''
+GUARD_HEREDOC_MANY=0
+guard_heredoc_shells_out() {
+  local bin="$1" tails tail seg n=0
+  GUARD_HEREDOC_ACTION=''
+  GUARD_HEREDOC_MANY=0
+  [ -n "${GUARD_HEREDOC_BODY:-}" ] || return 1
+  guard_exec_re
+  printf '%s' "$GUARD_HEREDOC_BODY" | grep -qE "$GUARD_EXEC_RE" || return 1
+  # Every mention of the binary with the text that follows it on that line.
+  # Bounded on purpose: this slice is what gets expanded and tokenized below,
+  # and an unbounded one puts a 9 KB single-line payload through a quadratic
+  # ${var//…} under bash 3.2 (the 44-second case in CLAUDE.md). 80 is past the
+  # longest `--context … delete …` prefix worth reading; anything further is a
+  # later call, and guard_subcommand takes the first verb regardless.
+  #
+  # A binary can be named by path — `subprocess.run(['/usr/local/bin/kubectl',
+  # 'delete',…])` is the same call as the bare name, and guard_invocation below
+  # already compares basenames — so a run of `dir/` components may precede it.
+  # What must NOT precede it is a bare `.`, or `/repo/.git/config` would read as
+  # an invocation of git. The tail is mandatory for the same reason: the name
+  # has to *end* where the binary does, or `feature/gitignore` reads as a
+  # mention of git with no verb, i.e. as a reason to ask. `sh.` is the one
+  # attribute form allowed through, because the python sh module spells a call
+  # `sh.kubectl('delete',…)`; it fails guard_invocation below and asks, which is
+  # the right answer for a call whose verb is in a place argv never puts it.
+  tails=$(printf '%s' "$GUARD_HEREDOC_BODY" \
+    | grep -oE "(^|[^A-Za-z0-9_./-])(sh\.|[A-Za-z0-9_.~-]*/)*$bin([^A-Za-z0-9_-].{0,80}|\$)") || return 1
+  [ -n "$tails" ] || return 1
+  # A style whose verb never reaches argv cannot be cleared by reading the call
+  # text: for mysql/psql the verb is a SQL keyword inside a payload, so every
+  # mention stays unreadable and the old blanket behaviour is the right one.
+  # Defensive, not load-bearing — the loop below has no `sql` arm either, so
+  # the decision is the same without this line. What it buys is that the SQL
+  # classifier is never entered with a $GUARD_SEG belonging to some other
+  # segment, which is how it would come to name a verb that is not there.
+  case "$GUARD_STYLE" in sql) return 0 ;; esac
+
+  while IFS= read -r tail; do
+    [ -n "$tail" ] || continue
+    # Bounded, because clearing a mention costs a tokenize and a classify and
+    # the old rule paid for neither — it asked on the first one and returned.
+    # Forty calls to the same guarded binary is not the read-only analysis this
+    # exemption exists for, and reading ten thousand of them is the "Bash call
+    # that never returns" this file is otherwise careful about. Past the cap it
+    # stops reading and asks, which is what an unread mention always means.
+    n=$((n + 1))
+    if [ $n -gt 40 ]; then
+      GUARD_HEREDOC_MANY=1
+      return 0
+    fi
+    # The call text as argv. Quotes, commas and brackets are what the language
+    # uses where a shell would have used spaces; the window is short, so the
+    # expansion is cheap. Anything the split leaves attached to the binary
+    # (`sh.kubectl`, `BIN=kubectl`) fails guard_invocation below and asks.
+    seg="${tail//[\'\"\`,()\[\]]/ }"
+    guard_invocation "$bin" "$seg" || return 0
+    if guard_classify; then
+      GUARD_HEREDOC_ACTION="$GUARD_ACTION"
+      return 0
+    fi
+    # Not destructive — but "no verb found" returns the same way, and the two
+    # must not be confused here. Only a verb the profile recognises clears a
+    # mention; silence on an unrecognised one is how a runtime-assembled
+    # command would walk straight through.
+    case "$GUARD_STYLE" in
+      vocab)      [ -n "$GUARD_SUB" ] && continue ;;
+      positional) guard_pos_match "${GUARD_DESTRUCTIVE}|${GUARD_READONLY}" >/dev/null && continue ;;
+    esac
+    return 0
+  done <<EOF
+$tails
+EOF
+  return 1
 }
 
 # --- executed scripts -------------------------------------------------------
@@ -535,13 +793,18 @@ EOF
 # command also executes that path: writing a runbook stays free.
 guard_inline_scripts() {
   local raw="$1" segs="$2"
-  local seg path targets='|' found=0 n=0
+  local seg path targets='|' found=0 n=0 opaque=''
   local line delim='' dashed=0 trimmed spec dl body='' consumer wrote='' emit=0
 
-  # Cheap pre-filter: a command that writes no file cannot write a script.
+  # Cheap pre-filter: a command that writes no file cannot write a script —
+  # unless the writing happens inside an interpreter body, where the API call
+  # does it and no redirection appears on the command line at all.
   # `tee` earns its own arm because it takes the file as an operand — there is
   # no `>` anywhere in `tee deploy.sh <<'EOF'`.
-  case "$raw" in *'>'*|*tee*) ;; *) return 0 ;; esac
+  case "$raw" in
+    *'>'*|*tee*) ;;
+    *) [ -n "${GUARD_HEREDOC_BODY:-}" ] || return 0 ;;
+  esac
 
   # What this command executes. The filesystem is deliberately not consulted —
   # the whole point is that the file is not there yet.
@@ -552,10 +815,26 @@ guard_inline_scripts() {
     [ -n "$path" ] || continue
     targets="$targets${path#./}|"
     found=1
+    # Generated by the interpreter itself: `python3 - <<'PY' … open('/tmp/d.sh',
+    # 'w').write(render()) … PY` then `bash /tmp/d.sh`. The other arms pair a
+    # body with a file because a pass-through consumer wrote it verbatim; here
+    # the writer is a program, so what the file will hold is not in the command
+    # at all and can only be asked about.
+    if [ -z "$opaque" ]; then
+      case "${GUARD_HEREDOC_BODY:-}" in
+        *"${path#./}"*) opaque="${GUARD_HEREDOC_CONSUMER:-an interpreter} ${path#./}" ;;
+      esac
+    fi
   done <<EOF
 $segs
 EOF
   [ $found -eq 1 ] || return 0
+  # Naming a path is not writing it: `print(open('deploy.sh').read())` next to a
+  # `bash deploy.sh` is reading a script that already exists, and prompting on it
+  # would spend the prompt where nothing is being created.
+  if [ -n "$opaque" ]; then
+    printf '%s' "$GUARD_HEREDOC_BODY" | grep -qE "$GUARD_FILE_WRITE_HINTS" || opaque=''
+  fi
 
   # `echo "kubectl … delete …" > deploy.sh`, `printf … > deploy.sh`
   while IFS= read -r seg; do
@@ -563,7 +842,21 @@ EOF
     case "$seg" in *'>'*) ;; *) continue ;; esac
     guard_head_word "$seg" || continue
     consumer="$GUARD_HEAD_WORD"
-    case "$consumer" in echo|printf) ;; *) continue ;; esac
+    # cat and tee are the third loop's, and anything else redirecting into a
+    # script this command runs is a producer whose output nobody can read —
+    # `curl … > deploy.sh && bash deploy.sh` is `curl … | bash` with one more
+    # step, and that one already asks.
+    case "$consumer" in
+      echo|printf) ;;
+      cat|tee)     continue ;;
+      *)
+        if [ -z "$opaque" ]; then
+          wrote=$(guard_redirect_target "$seg") || continue
+          wrote="${wrote#./}"
+          case "$targets" in *"|$wrote|"*) opaque="$consumer $wrote" ;; esac
+        fi
+        continue ;;
+    esac
     wrote=$(guard_redirect_target "$seg") || continue
     wrote="${wrote#./}"
     case "$targets" in *"|$wrote|"*) ;; *) continue ;; esac
@@ -574,6 +867,7 @@ EOF
   done <<EOF
 $segs
 EOF
+  [ -n "$opaque" ] && printf '#guard-opaque-write %s\n' "$opaque"
 
   # `cat > deploy.sh <<'EOF' … EOF`, `tee deploy.sh <<'EOF' … EOF`
   while IFS= read -r line; do
@@ -604,7 +898,7 @@ EOF
         dl="${dl#[\"\'\\]}"; dl="${dl%[\"\']}"
         delim="$dl"
         body=''; emit=0; wrote=''
-        guard_head_word "$line" || GUARD_HEAD_WORD=''
+        guard_heredoc_consumer "$line" || GUARD_HEAD_WORD=''
         consumer="$GUARD_HEAD_WORD"
         case "$consumer" in
           cat) wrote=$(guard_redirect_target "$line") || wrote='' ;;
