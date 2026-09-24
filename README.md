@@ -56,8 +56,18 @@ Namespaced as `/dotfiles:<name>`:
 
 ```sh
 bats tests/guards.bats
+python3 tests/matrix.py          # -v for prompt text, -k PATTERN to filter
 claude plugin validate . --strict
 ```
+
+The two suites do different jobs. `guards.bats` pins one behaviour at a time,
+each case carrying the reason it exists; `tests/matrix.py` sweeps the *product*
+of the things that decide how a heredoc body is read — who consumes it, which
+exec API it calls, how the binary is spelled, what writes the script that runs —
+and prints a table of every divergence. It is what finds the holes that
+`guards.bats` then pins, so a new consumer or exec API is worth one line there
+first. It exits non-zero on any divergence and needs nothing but the standard
+library.
 
 Profiles live in `hooks/guards/<tool>.guard`; adding a tool is one new file.
 How the guard is built and what every rule in it protects against is in
