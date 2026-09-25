@@ -1,6 +1,6 @@
 {
   "name": "dotfiles",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Env guards that make destructive commands against non-local targets (kubectl, helm, terraform, argocd, gh, mysql, …) ask first, plus review, debugging and authoring skills.",
   "author": {
     "name": "Eduard Zintz",
